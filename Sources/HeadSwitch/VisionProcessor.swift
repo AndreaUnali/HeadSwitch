@@ -1,8 +1,8 @@
 import Vision
 import CoreMedia
 
-/// Estrae lo yaw dal frame con Vision (revisione 3 di VNDetectFaceRectanglesRequest,
-/// che popola yaw/pitch/roll in VNFaceObservation) e lo passa al detector.
+/// Estrae yaw e pitch dal frame con Vision (revisione 3 di VNDetectFaceRectanglesRequest,
+/// che popola yaw/pitch/roll in VNFaceObservation) e li passa al detector.
 final class VisionProcessor {
     private let detector: GazeZoneDetector
     private let handler = VNSequenceRequestHandler()
@@ -25,9 +25,11 @@ final class VisionProcessor {
                 .filter { $0.boundingBox.width > 0.12 }
                 .max { $0.boundingBox.width * $0.boundingBox.height <
                        $1.boundingBox.width * $1.boundingBox.height }
-            detector.process(yawRadians: face?.yaw?.doubleValue, at: t)
+            detector.process(yawRadians: face?.yaw?.doubleValue,
+                             pitchRadians: face?.pitch?.doubleValue,
+                             at: t)
         } catch {
-            detector.process(yawRadians: nil, at: t)
+            detector.process(yawRadians: nil, pitchRadians: nil, at: t)
         }
     }
 }

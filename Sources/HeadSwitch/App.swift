@@ -38,6 +38,10 @@ struct MenuContent: View {
         Divider()
         Button("Ricalibra schermi…") { controller.requestCalibration() }
             .disabled(!settings.trackingEnabled || controller.isBusy)
+        Picker("Punti di calibrazione", selection: $settings.calibrationPointCount) {
+            Text("5 punti (veloce)").tag(5)
+            Text("9 punti (preciso)").tag(9)
+        }
         Picker("Reattività", selection: $settings.dwellMilliseconds) {
             Text("Veloce").tag(300.0)
             Text("Normale").tag(400.0)

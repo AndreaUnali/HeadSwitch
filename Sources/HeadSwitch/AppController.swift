@@ -12,7 +12,7 @@ final class AppController: ObservableObject {
     @Published var statusText = "Spento"
     @Published var isBusy = false
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
-    /// Mostra nella barra dei menu l'angolo misurato e lo schermo rilevato (per verificare la calibrazione).
+    /// Mostra nella barra dei menu yaw, pitch e schermo rilevato (per verificare la calibrazione).
     @Published var diagnostics = false {
         didSet {
             detector.setWantsSamples(diagnostics || isBusy)
@@ -33,16 +33,15 @@ final class AppController: ObservableObject {
 
     // Stato della misura di un punto di calibrazione
     private var collecting = false
-    private var window: [Double] = []
+    private var window: [(yaw: Double, pitch: Double)] = []
     private var stableFrames = 0
-    private var acceptedYaw: Double?
+    private var acceptedPose: (yaw: Double, pitch: Double)?
     private var calibModel: CalibrationModel?
 
-    /// Posizioni orizzontali (frazione della larghezza) dei punti da guardare su ogni schermo.
-    private static let calibrationFractions: [Double] = [0.12, 0.5, 0.88]
-    /// Un punto è acquisito quando lo yaw resta entro `stabilitySpread` gradi per ~1 secondo.
+    /// Un punto è acquisito quando yaw e pitch restano stabili per ~1 secondo.
     private static let stabilityWindow = 8
-    private static let stabilitySpread = 3.0
+    private static let yawSpread = 4.0
+    private static let pitchSpread = 5.0
     private static let stableFramesNeeded = 5
 
     private init() {
@@ -69,8 +68,8 @@ final class AppController: ObservableObject {
         detector.onZoneChange = { [weak self] zone in
             Task { @MainActor in self?.handleZone(zone) }
         }
-        detector.onSample = { [weak self] raw in
-            Task { @MainActor in self?.receive(raw: raw) }
+        detector.onSample = { [weak self] yaw, pitch in
+            Task { @MainActor in self?.receive(yaw: yaw, pitch: pitch) }
         }
 
         syncConfig()
@@ -133,12 +132,18 @@ final class AppController: ObservableObject {
 
     // MARK: - Configurazione schermi
 
+    private func poseSamples(for screen: NSScreen, from calibration: [String: [[Double]]]) -> [PoseSample] {
+        (calibration[String(screen.displayID)] ?? []).compactMap { row in
+            row.count == 4 ? PoseSample(u: row[0], v: row[1], yaw: row[2], pitch: row[3]) : nil
+        }
+    }
+
     private func gazeConfig() -> GazeConfig {
         let dwell = settings.dwellMilliseconds / 1000
         let screens = NSScreen.leftToRight
         guard screens.count >= 2 else { return GazeConfig(dwell: dwell) }
-        let points = screens.map { settings.calibration[String($0.displayID)] ?? [] }
-        return GazeConfig.make(points: points, dwell: dwell, smoothingAlpha: 0.5) ?? GazeConfig(dwell: dwell)
+        let samples = screens.map { poseSamples(for: $0, from: settings.calibration) }
+        return GazeConfig.make(samples: samples, dwell: dwell, smoothingAlpha: 0.5) ?? GazeConfig(dwell: dwell)
     }
 
     private var isCalibrated: Bool { gazeConfig().isCalibrated }
@@ -169,42 +174,53 @@ final class AppController: ObservableObject {
 
     // MARK: - Campioni dalla camera (calibrazione + diagnostica)
 
-    private func receive(raw: Double?) {
+    private func receive(yaw: Double?, pitch: Double?) {
         if collecting {
-            guard let raw else {
+            guard let yaw, let pitch else {
                 window.removeAll(); stableFrames = 0; calibModel?.progress = 0
                 return
             }
-            window.append(raw)
+            window.append((yaw: yaw, pitch: pitch))
             if window.count > Self.stabilityWindow { window.removeFirst() }
-            if window.count == Self.stabilityWindow,
-               let lo = window.min(), let hi = window.max(), hi - lo <= Self.stabilitySpread {
-                stableFrames += 1
+            if window.count == Self.stabilityWindow {
+                let ys = window.map { $0.yaw }
+                let ps = window.map { $0.pitch }
+                let stable = (ys.max()! - ys.min()!) <= Self.yawSpread && (ps.max()! - ps.min()!) <= Self.pitchSpread
+                stableFrames = stable ? stableFrames + 1 : 0
             } else {
                 stableFrames = 0
             }
             calibModel?.progress = min(1, Double(stableFrames) / Double(Self.stableFramesNeeded))
-            if stableFrames >= Self.stableFramesNeeded, acceptedYaw == nil {
-                acceptedYaw = median(window)
+            if stableFrames >= Self.stableFramesNeeded, acceptedPose == nil {
+                acceptedPose = medianPose(window)
             }
             return
         }
-        if diagnostics { updateLive(raw) }
+        if diagnostics { updateLive(yaw: yaw, pitch: pitch) }
     }
 
-    private func updateLive(_ raw: Double?) {
+    private func updateLive(yaw: Double?, pitch: Double?) {
         guard Date().timeIntervalSince(lastLiveUpdate) > 0.25 else { return }
         lastLiveUpdate = Date()
-        guard let raw else { liveInfo = "no volto"; return }
-        let c = gazeConfig()
-        guard c.isCalibrated else { liveInfo = String(format: "%+.0f°", raw); return }
-        let v = raw * c.sign
-        var z = 0
-        while z < c.boundaries.count && v > c.boundaries[z] { z += 1 }
-        liveInfo = String(format: "%+.0f° → %d", v, z + 1)
+        guard let yaw, let pitch else { liveInfo = "no volto"; return }
+        if let best = gazeConfig().nearest(yaw: yaw, pitch: pitch) {
+            liveInfo = String(format: "%+.0f° %+.0f° → %d", yaw, pitch, best.index + 1)
+        } else {
+            liveInfo = String(format: "%+.0f° %+.0f°", yaw, pitch)
+        }
     }
 
     // MARK: - Calibrazione guidata
+
+    /// Punti da guardare su ogni schermo (u: sinistra→destra, v: alto→basso), in un ordine comodo da seguire.
+    private func calibrationGrid() -> [(u: Double, v: Double)] {
+        if settings.calibrationPointCount >= 9 {
+            return [(0.12, 0.15), (0.5, 0.15), (0.88, 0.15),
+                    (0.88, 0.5), (0.5, 0.5), (0.12, 0.5),
+                    (0.12, 0.85), (0.5, 0.85), (0.88, 0.85)]
+        }
+        return [(0.12, 0.5), (0.5, 0.5), (0.88, 0.5), (0.5, 0.15), (0.5, 0.85)]
+    }
 
     func requestCalibration() {
         guard !isBusy, ready else { return }
@@ -231,51 +247,56 @@ final class AppController: ObservableObject {
             detector.reset()
         }
 
-        var result: [String: [Double]] = [:]
+        let grid = calibrationGrid()
+        var result: [String: [[Double]]] = [:]
         for (i, screen) in screens.enumerated() {
-            var points: [Double] = []
-            for (j, fraction) in Self.calibrationFractions.enumerated() {
+            var rows: [[Double]] = []
+            for (j, spot) in grid.enumerated() {
                 guard settings.trackingEnabled else { return }
-                let panel = CalibrationPanel(screen: screen, fraction: fraction,
+                let panel = CalibrationPanel(screen: screen, u: spot.u, v: spot.v,
                                              screenIndex: i + 1, screenTotal: screens.count,
-                                             pointIndex: j + 1, pointTotal: Self.calibrationFractions.count)
+                                             screenName: screen.localizedName,
+                                             pointIndex: j + 1, pointTotal: grid.count)
                 panel.show()
                 try? await Task.sleep(nanoseconds: 700_000_000)      // tempo minimo per girare la testa
 
-                // Aspetta che la testa sia ferma (~1 s entro 3°), poi prendi la misura.
-                window.removeAll(); stableFrames = 0; acceptedYaw = nil
+                // Aspetta che la testa sia ferma (~1 s), poi prendi la misura.
+                window.removeAll(); stableFrames = 0; acceptedPose = nil
                 calibModel = panel.model
                 collecting = true
                 var waited = 0.0
-                while acceptedYaw == nil && waited < 10 && settings.trackingEnabled {
+                while acceptedPose == nil && waited < 10 && settings.trackingEnabled {
                     try? await Task.sleep(nanoseconds: 50_000_000)
                     waited += 0.05
+                }
+                // Se non si è mai fermata del tutto, usa comunque le ultime misure (meglio di fallire).
+                if acceptedPose == nil, window.count >= Self.stabilityWindow {
+                    acceptedPose = medianPose(window)
                 }
                 collecting = false
                 calibModel = nil
                 panel.close()
 
                 guard settings.trackingEnabled else { return }
-                guard let yaw = acceptedYaw else {
-                    fail("Non riesco a misurare una posizione stabile. Guarda il punto girando la testa, tienila ferma finché l'anello non si completa, e controlla che il volto sia ben illuminato. Poi scegli «Ricalibra schermi».")
+                guard let pose = acceptedPose else {
+                    fail("Non riesco a vedere il tuo volto. Controlla che la webcam non sia coperta e che ci sia luce, poi scegli «Ricalibra schermi».")
                     return
                 }
-                points.append(yaw)
+                rows.append([spot.u, spot.v, pose.yaw, pose.pitch])
                 try? await Task.sleep(nanoseconds: 150_000_000)
             }
-            result[String(screen.displayID)] = points
+            result[String(screen.displayID)] = rows
         }
 
-        let ordered = screens.map { result[String($0.displayID)] ?? [] }
-        guard GazeConfig.make(points: ordered, dwell: 0.4, smoothingAlpha: 0.5) != nil else {
-            fail("Gli angoli misurati per i due schermi sono troppo simili o in ordine strano. Gira bene la testa verso ogni punto e riprova da «Ricalibra schermi».")
+        let samples = screens.map { poseSamples(for: $0, from: result) }
+        guard let config = GazeConfig.make(samples: samples, dwell: 0.4, smoothingAlpha: 0.5) else {
+            fail("Gli angoli misurati per gli schermi sono troppo simili. Gira bene la testa verso ogni punto e riprova da «Ricalibra schermi».")
             return
         }
 
         settings.calibration = result
         syncConfig()
-        let centers = ordered.map { String(format: "%+.0f°", $0.reduce(0, +) / Double($0.count)) }
-        statusText = "Attivo · calibrato ✓ (\(centers.joined(separator: "  ")))"
+        statusText = String(format: "Attivo · calibrato ✓ (errore ~%.1f°)", config.fitError)
     }
 
     private func fail(_ text: String) {
@@ -291,6 +312,10 @@ final class AppController: ObservableObject {
     private func median(_ values: [Double]) -> Double {
         let s = values.sorted()
         return s[s.count / 2]
+    }
+
+    private func medianPose(_ w: [(yaw: Double, pitch: Double)]) -> (yaw: Double, pitch: Double) {
+        (yaw: median(w.map { $0.yaw }), pitch: median(w.map { $0.pitch }))
     }
 
     // MARK: - Cambio di focus
