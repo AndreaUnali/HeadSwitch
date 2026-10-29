@@ -42,7 +42,12 @@ struct ScreenPoseModel: Sendable {
     /// Distanza (gradi) tra una posa e la regione dello schermo: 0 = stai guardando dentro lo schermo.
     /// Cerca il punto (u, v) dello schermo più vicino alla posa; la regolarizzazione verso il centro
     /// evita instabilità quando una direzione (tipicamente il pitch) è poco informativa.
-    func distance(yaw py: Double, pitch pp: Double, pitchWeight w: Double) -> Double {
+    func distance(yaw: Double, pitch: Double, pitchWeight: Double) -> Double {
+        project(yaw: yaw, pitch: pitch, pitchWeight: pitchWeight).distance
+    }
+
+    /// Punto (u, v) dello schermo più vicino alla posa (limitato a 0...1) e distanza in gradi.
+    func project(yaw py: Double, pitch pp: Double, pitchWeight w: Double) -> (u: Double, v: Double, distance: Double) {
         let lambda = 25.0
         let a00 = yu, a01 = yv
         let a10 = pu * w, a11 = pv * w
@@ -60,7 +65,7 @@ struct ScreenPoseModel: Sendable {
         v = min(max(v, 0), 1)
         let ey = py - yaw(u, v)
         let ep = (pp - pitch(u, v)) * w
-        return (ey * ey + ep * ep).squareRoot()
+        return (u, v, (ey * ey + ep * ep).squareRoot())
     }
 }
 
@@ -155,10 +160,13 @@ final class GazeZoneDetector: @unchecked Sendable {
     var onZoneChange: (@Sendable (Int) -> Void)?
     /// Posa smussata (yaw, pitch in gradi). nil = nessun volto.
     var onSample: (@Sendable (Double?, Double?) -> Void)?
+    /// (indice dello schermo corrente, u, v): punto guardato sullo schermo. Solo se attivato con `setWantsGaze`.
+    var onGaze: (@Sendable (Int, Double, Double) -> Void)?
 
     private let lock = NSLock()
     private var config = GazeConfig()
     private var wantsSamples = false
+    private var wantsGaze = false
     private var suppressed = false
     private var smoothedYaw: Double?
     private var smoothedPitch: Double?
@@ -168,6 +176,7 @@ final class GazeZoneDetector: @unchecked Sendable {
 
     func updateConfig(_ new: GazeConfig) { lock.lock(); config = new; lock.unlock() }
     func setWantsSamples(_ on: Bool) { lock.lock(); wantsSamples = on; lock.unlock() }
+    func setWantsGaze(_ on: Bool) { lock.lock(); wantsGaze = on; lock.unlock() }
     func setSuppressed(_ on: Bool) { lock.lock(); suppressed = on; lock.unlock() }
     func reset() {
         lock.lock()
@@ -180,10 +189,12 @@ final class GazeZoneDetector: @unchecked Sendable {
         var changed: Int?
         var outYaw: Double?
         var outPitch: Double?
+        var gaze: (Int, Double, Double)?
 
         lock.lock()
         let c = config
         let sampling = wantsSamples
+        let gazing = wantsGaze
         if let yawRadians {
             let yawDeg = yawRadians * 180 / .pi
             let pitchDeg = pitchRadians.map { $0 * 180 / .pi } ?? smoothedPitch ?? 0
@@ -196,6 +207,10 @@ final class GazeZoneDetector: @unchecked Sendable {
             outPitch = ps
             if !suppressed, c.isCalibrated {
                 changed = classify(yaw: ys, pitch: ps, time: time, config: c)
+                if gazing, let cur = current, cur < c.models.count {
+                    let p = c.models[cur].project(yaw: ys, pitch: ps, pitchWeight: c.pitchWeight)
+                    if p.distance <= c.awayDistance { gaze = (cur, p.u, p.v) }
+                }
             }
         } else {
             smoothedYaw = nil
@@ -204,6 +219,7 @@ final class GazeZoneDetector: @unchecked Sendable {
         }
         lock.unlock()
 
+        if let gaze { onGaze?(gaze.0, gaze.1, gaze.2) }     // prima del cambio zona: l'ordine conta
         if let changed { onZoneChange?(changed) }
         if sampling { onSample?(outYaw, outPitch) }
     }

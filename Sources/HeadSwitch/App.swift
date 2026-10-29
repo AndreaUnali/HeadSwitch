@@ -47,6 +47,9 @@ struct MenuContent: View {
             Text("Normale").tag(400.0)
             Text("Calma").tag(650.0)
         }
+        Button(settings.windowSelection ? "✓ Selezione per finestra (beta)" : "Selezione per finestra (beta)") {
+            settings.windowSelection.toggle()
+        }
         Button(settings.glowEnabled ? "✓ Luce di contorno" : "Luce di contorno") {
             settings.glowEnabled.toggle()
         }

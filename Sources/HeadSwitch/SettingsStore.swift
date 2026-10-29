@@ -15,6 +15,10 @@ final class SettingsStore: ObservableObject {
     @Published var glowEnabled: Bool {
         didSet { UserDefaults.standard.set(glowEnabled, forKey: "glowEnabled") }
     }
+    /// Beta: oltre allo schermo, sceglie anche la finestra guardata dentro lo schermo.
+    @Published var windowSelection: Bool {
+        didSet { UserDefaults.standard.set(windowSelection, forKey: "windowSelection") }
+    }
     /// Punti di calibrazione per schermo: 5 (veloce) o 9 (preciso).
     @Published var calibrationPointCount: Int {
         didSet { UserDefaults.standard.set(calibrationPointCount, forKey: "calibrationPointCount") }
@@ -29,6 +33,7 @@ final class SettingsStore: ObservableObject {
         trackingEnabled       = d.object(forKey: "trackingEnabled") as? Bool ?? false
         dwellMilliseconds     = d.object(forKey: "dwellMilliseconds") as? Double ?? 400
         glowEnabled           = d.object(forKey: "glowEnabled") as? Bool ?? true
+        windowSelection       = d.object(forKey: "windowSelection") as? Bool ?? false
         calibrationPointCount = d.object(forKey: "calibrationPointCount") as? Int ?? 5
         calibration           = d.dictionary(forKey: "calibrationSamples") as? [String: [[Double]]] ?? [:]
     }

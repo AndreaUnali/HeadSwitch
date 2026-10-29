@@ -38,6 +38,12 @@ final class AppController: ObservableObject {
     private var acceptedPose: (yaw: Double, pitch: Double)?
     private var calibModel: CalibrationModel?
 
+    // Selezione per finestra (beta)
+    private var lastGaze: (zone: Int, point: CGPoint)?
+    private var windowCandidate: Int?
+    private var windowCandidateSince = Date.distantPast
+    private var lastWindowCheck = Date.distantPast
+
     /// Un punto è acquisito quando yaw e pitch restano stabili per ~1 secondo.
     private static let stabilityWindow = 8
     private static let yawSpread = 4.0
@@ -71,6 +77,11 @@ final class AppController: ObservableObject {
         detector.onSample = { [weak self] yaw, pitch in
             Task { @MainActor in self?.receive(yaw: yaw, pitch: pitch) }
         }
+
+        detector.onGaze = { [weak self] zone, u, v in
+            Task { @MainActor in self?.receiveGaze(zone: zone, u: u, v: v) }
+        }
+        WindowManager.configure()
 
         syncConfig()
         settings.objectWillChange
@@ -148,7 +159,10 @@ final class AppController: ObservableObject {
 
     private var isCalibrated: Bool { gazeConfig().isCalibrated }
 
-    private func syncConfig() { detector.updateConfig(gazeConfig()) }
+    private func syncConfig() {
+        detector.updateConfig(gazeConfig())
+        detector.setWantsGaze(settings.windowSelection)
+    }
 
     private func screensChanged() {
         syncConfig()
@@ -326,8 +340,63 @@ final class AppController: ObservableObject {
         statusText = "Attivo · guardi lo schermo \(zone + 1)"
         guard NSEvent.pressedMouseButtons == 0 else { return }   // non interrompere un trascinamento
         let screen = screens[zone]
-        let focused = WindowManager.focusTopWindow(on: screen)
+
+        var focused: FocusedWindow?
+        if settings.windowSelection, let g = lastGaze, g.zone == zone,
+           let target = WindowManager.windowUnder(g.point) {
+            focused = WindowManager.focus(target)                // la finestra sotto lo sguardo
+        }
+        if focused == nil { focused = WindowManager.focusTopWindow(on: screen) }
         if settings.glowEnabled { FocusGlow.shared.flash(window: focused, screen: screen) }
+    }
+
+    // MARK: - Selezione per finestra (beta)
+
+    private func receiveGaze(zone: Int, u: Double, v: Double) {
+        let screens = NSScreen.leftToRight
+        guard zone < screens.count else { return }
+        let d = CGDisplayBounds(screens[zone].displayID)        // coordinate CG, y verso il basso
+        let point = CGPoint(x: d.minX + u * d.width, y: d.minY + v * d.height)
+        lastGaze = (zone, point)
+
+        guard settings.windowSelection, ready, !isBusy else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastWindowCheck) > 0.1 else { return }
+        lastWindowCheck = now
+        updateWindowFocus(at: point, on: screens[zone])
+    }
+
+    private func updateWindowFocus(at point: CGPoint, on screen: NSScreen) {
+        guard let target = WindowManager.windowUnder(point) else { windowCandidate = nil; return }
+
+        // Stai ancora guardando la finestra già a fuoco (con un po' di tolleranza): non fare nulla.
+        if let f = WindowManager.focusedWindowBounds() {
+            let margin = max(30.0, 0.04 * CGDisplayBounds(screen.displayID).width)
+            if f.insetBy(dx: -margin, dy: -margin).contains(point) || WindowManager.sameFrame(f, target.bounds) {
+                windowCandidate = nil
+                return
+            }
+        }
+
+        // Nuova finestra: deve restare sotto lo sguardo per `dwell` secondi.
+        if windowCandidate != target.windowNumber {
+            windowCandidate = target.windowNumber
+            windowCandidateSince = Date()
+            return
+        }
+        guard Date().timeIntervalSince(windowCandidateSince) >= settings.dwellMilliseconds / 1000 else { return }
+        guard keyboardIdle else { return }                       // stai scrivendo: aspetta
+        guard NSEvent.pressedMouseButtons == 0 else { return }
+
+        windowCandidate = nil
+        if let focused = WindowManager.focus(target), settings.glowEnabled {
+            FocusGlow.shared.flash(window: focused, screen: screen)
+        }
+    }
+
+    /// Nessun tasto premuto negli ultimi ~0,8 s: evita di spostare il focus mentre scrivi.
+    private var keyboardIdle: Bool {
+        CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown) > 0.8
     }
 
     // MARK: - Apri al login

@@ -6,20 +6,27 @@ struct FocusedWindow {
     let windowNumber: Int     // CGWindowID
 }
 
-/// Porta in primo piano (e dà il focus a) la finestra più in alto su uno schermo.
-/// Usa CGWindowList per sapere quali finestre stanno su quale schermo e le API di Accessibilità per attivarle.
-enum WindowManager {
-    /// Ritorna la finestra messa a fuoco, o nil se sullo schermo non ce n'è una utilizzabile.
-    static func focusTopWindow(on screen: NSScreen) -> FocusedWindow? {
-        guard AXIsProcessTrusted() else { return nil }
-        let display = CGDisplayBounds(screen.displayID)
-        let myPID = ProcessInfo.processInfo.processIdentifier
+struct WindowCandidate {
+    let pid: pid_t
+    let bounds: CGRect
+    let windowNumber: Int
+}
 
+/// Trova e porta in primo piano (dando il focus) le finestre.
+/// Usa CGWindowList per sapere dove stanno le finestre e le API di Accessibilità per attivarle.
+enum WindowManager {
+    /// Da chiamare una volta all'avvio: evita che un'app bloccata congeli HeadSwitch per secondi.
+    static func configure() {
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.25)
+    }
+
+    /// Finestre normali visibili, dalla più in alto alla più in basso.
+    static func visibleWindows() -> [WindowCandidate] {
+        let myPID = ProcessInfo.processInfo.processIdentifier
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-        guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
-            return nil
-        }
-        // La lista è ordinata dalla finestra più in alto a quella più in basso.
+        guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return [] }
+
+        var result: [WindowCandidate] = []
         for info in list {
             guard (info[kCGWindowLayer as String] as? Int) == 0,                 // solo finestre normali
                   let pidInt = info[kCGWindowOwnerPID as String] as? Int,
@@ -28,24 +35,63 @@ enum WindowManager {
                   ((info[kCGWindowAlpha as String] as? Double) ?? 1) > 0.01,
                   let dict = info[kCGWindowBounds as String] as? [String: Any],
                   let bounds = CGRect(dictionaryRepresentation: dict as CFDictionary),
-                  bounds.width >= 120, bounds.height >= 80,
-                  display.contains(CGPoint(x: bounds.midX, y: bounds.midY))
+                  bounds.width >= 120, bounds.height >= 80
             else { continue }
-            if raise(pid: pid_t(pidInt), matching: bounds) { return FocusedWindow(bounds: bounds, windowNumber: number) }
+            result.append(WindowCandidate(pid: pid_t(pidInt), bounds: bounds, windowNumber: number))
+        }
+        return result
+    }
+
+    /// La finestra più in alto che contiene il punto (coordinate CG).
+    static func windowUnder(_ point: CGPoint) -> WindowCandidate? {
+        visibleWindows().first { $0.bounds.contains(point) }
+    }
+
+    /// Dà il focus alla finestra più in alto su uno schermo.
+    static func focusTopWindow(on screen: NSScreen) -> FocusedWindow? {
+        guard AXIsProcessTrusted() else { return nil }
+        let display = CGDisplayBounds(screen.displayID)
+        for w in visibleWindows() where display.contains(CGPoint(x: w.bounds.midX, y: w.bounds.midY)) {
+            if raise(w) { return FocusedWindow(bounds: w.bounds, windowNumber: w.windowNumber) }
         }
         return nil
     }
 
-    private static func raise(pid: pid_t, matching bounds: CGRect) -> Bool {
-        let app = AXUIElementCreateApplication(pid)
+    static func focus(_ w: WindowCandidate) -> FocusedWindow? {
+        guard AXIsProcessTrusted(), raise(w) else { return nil }
+        return FocusedWindow(bounds: w.bounds, windowNumber: w.windowNumber)
+    }
+
+    /// Bounds (coordinate CG) della finestra che ha il focus in questo momento.
+    static func focusedWindowBounds() -> CGRect? {
+        let system = AXUIElementCreateSystemWide()
+        var appRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedApplicationAttribute as CFString, &appRef) == .success,
+              let appRef else { return nil }
+        let app = appRef as! AXUIElement
+        var winRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &winRef) == .success,
+              let winRef else { return nil }
+        return frame(of: winRef as! AXUIElement)
+    }
+
+    static func sameFrame(_ a: CGRect, _ b: CGRect) -> Bool {
+        abs(a.minX - b.minX) < 4 && abs(a.minY - b.minY) < 4 &&
+        abs(a.width - b.width) < 4 && abs(a.height - b.height) < 4
+    }
+
+    // MARK: - Privato
+
+    private static func raise(_ w: WindowCandidate) -> Bool {
+        let app = AXUIElementCreateApplication(w.pid)
+        AXUIElementSetMessagingTimeout(app, 0.5)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
               let windows = value as? [AXUIElement] else { return false }
 
-        guard let window = windows.first(where: { w in
-            guard let f = frame(of: w) else { return false }
-            return abs(f.minX - bounds.minX) < 4 && abs(f.minY - bounds.minY) < 4 &&
-                   abs(f.width - bounds.width) < 4 && abs(f.height - bounds.height) < 4
+        guard let window = windows.first(where: { win in
+            guard let f = frame(of: win) else { return false }
+            return sameFrame(f, w.bounds)
         }) else { return false }
 
         AXUIElementPerformAction(window, kAXRaiseAction as CFString)
